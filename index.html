@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <title>Grandmaster WiFi Fizik Simülatörü</title>
+    <style>
+        body {
+            background-color: #121212;
+            color: #e0e0e0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+        h2 { margin: 10px 0; color: #00ffcc; text-shadow: 0 0 10px rgba(0,255,204,0.3); }
+        
+        #controls {
+            background: #1e1e1e;
+            padding: 15px;
+            border-radius: 8px;
+            display: flex;
+            gap: 20px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            margin-bottom: 10px;
+            z-index: 10;
+        }
+        
+        .control-group { display: flex; flex-direction: column; gap: 5px; }
+        label { font-size: 12px; color: #aaa; font-weight: bold; }
+        select, button {
+            padding: 8px;
+            background: #333;
+            border: 1px solid #444;
+            color: white;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover { background: #444; }
+        button.active { background: #00ffcc; color: black; font-weight: bold; }
+
+        #canvas-container {
+            position: relative;
+            box-shadow: 0 0 20px rgba(0,0,0,0.7);
+            cursor: crosshair;
+        }
+        canvas { border-radius: 4px; display: block; }
+
+        .legend {
+            margin-top: 10px;
+            display: flex;
+            gap: 5px;
+            align-items: center;
+            font-size: 12px;
+        }
+        .gradient-bar {
+            width: 300px;
+            height: 15px;
+            background: linear-gradient(to right, black, red, yellow, lime);
+            border-radius: 3px;
+        }
+        
+        #stats {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-family: monospace;
+            pointer-events: none;
+            color: #00ffcc;
+        }
+    </style>
+</head>
+<body>
+
+    <h2>📡 Gerçek Zamanlı WiFi Sinyal Simülatörü</h2>
+
+    <div id="controls">
+        <div class="control-group">
+            <label>Frekans Bandı</label>
+            <select id="freqSelect" onchange="updateParams()">
+                <option value="2.4">2.4 GHz (Uzun Menzil)</option>
+                <option value="5.0">5.0 GHz (Yüksek Hız/Kısa Menzil)</option>
+                <option value="6.0">6.0 GHz (WiFi 6E/7)</option>
+            </select>
+        </div>
+        <div class="control-group">
+            <label>Duvar Malzemesi (Çizmek için)</label>
+            <select id="materialSelect">
+                <option value="5">Cam/İnce Tahta (Az Kayıp)</option>
+                <option value="15" selected>Tuğla Duvar (Orta Kayıp)</option>
+                <option value="30">Beton/Metal (Yüksek Kayıp)</option>
+            </select>
+        </div>
+        <div class="control-group">
+            <label>Mod</label>
+            <div style="display:flex; gap:5px;">
+                <button id="btnMove" class="active" onclick="setMode('move')">Router Taşı</button>
+                <button id="btnDraw" onclick="setMode('draw')">Duvar Çiz</button>
+                <button onclick="clearWalls()">Duvarları Sil</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="canvas-container">
+        <canvas id="simCanvas" width="800" height="600"></canvas>
+        <div id="stats">Router Konumu: 400, 300</div>
+    </div>
+
+    <div class="legend">
+        <span>-90dBm (Ölü)</span>
+        <div class="gradient-bar"></div>
+        <span>-30dBm (Mükemmel)</span>
+    </div>
+
+<script>
+    // === FİZİK MOTORU AYARLARI ===
+    const canvas = document.getElementById('simCanvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    
+    // Simülasyon Durumu
+    let router = { x: 400, y: 300 };
+    let walls = []; // Duvarlar: {x1, y1, x2, y2, loss}
+    let mode = 'move'; // 'move' veya 'draw'
+    let isDragging = false;
+    let drawStart = null;
+    let frequency = 2.4; // GHz
+    
+    // Çözünürlük Skalası (Performans için blok boyutu)
+    const BLOCK_SIZE = 4; // Her 4 piksel için 1 hesaplama yap (Düşük=Kaliteli, Yüksek=Hızlı)
+
+    // Renk Haritası (dBm -> Renk)
+    function getColor(dbm) {
+        // dBm aralığı: -90 (Siyah) ile -30 (Yeşil)
+        let normalized = (dbm + 90) / 60; // 0 ile 1 arası
+        normalized = Math.max(0, Math.min(1, normalized));
+        
+        // HSL Renk Uzayı: 0(Kırmızı) -> 120(Yeşil)
+        // Parlaklığı sinyal gücüne göre ayarla
+        const hue = normalized * 120; 
+        const lightness = normalized * 50; 
+        
+        if (normalized <= 0.1) return `rgb(0,0,0)`; // Ölü nokta
+        return `hsl(${hue}, 100%, ${lightness}%)`;
+    }
+
+    // === MATEMATİKSEL HESAPLAMALAR ===
+    
+    // Çizgi Kesişim Kontrolü (Router ile Piksel arasında duvar var mı?)
+    function intersect(p1, p2, p3, p4) {
+        const det = (p2.x - p1.x) * (p4.y - p3.y) - (p4.x - p3.x) * (p2.y - p1.y);
+        if (det === 0) return false;
+        
+        const lambda = ((p4.y - p3.y) * (p4.x - p1.x) + (p3.x - p4.x) * (p4.y - p1.y)) / det;
+        const gamma = ((p1.y - p2.y) * (p4.x - p1.x) + (p2.x - p1.x) * (p4.y - p1.y)) / det;
+        
+        return (0 < lambda && lambda < 1) && (0 < gamma && gamma < 1);
+    }
+
+    // Isı Haritasını Çiz (Main Loop)
+    function drawHeatmap() {
+        // Ekranı temizle
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // Pikselleri tara (Grid şeklinde)
+        const width = canvas.width;
+        const height = canvas.height;
+        
+        // Frekans Kaybı (FSPL Sabiti)
+        // FSPL = 20log(d) + 20log(f) + K
+        // Basitleştirilmiş: Yüksek frekans, havada daha çabuk sönümlenir
+        const freqLoss = 20 * Math.log10(frequency * 1000); 
+
+        for (let y = 0; y < height; y += BLOCK_SIZE) {
+            for (let x = 0; x < width; x += BLOCK_SIZE) {
+                
+                // 1. Mesafe Kaybı (Free Space Path Loss)
+                const dist = Math.sqrt((x - router.x)**2 + (y - router.y)**2);
+                const realDistMeters = dist / 20; // 20px = 1 metre kabul edelim
+                
+                if (realDistMeters < 0.1) continue; // Router'ın tam içi
+
+                let pathLoss = 20 * Math.log10(realDistMeters) + freqLoss - 28; // -28 kalibrasyon sabiti
+                
+                // 2. Duvar Kaybı (Attenuation)
+                // Router ile şu anki piksel (x,y) arasına çizgi çek, duvar kesiyor mu bak
+                let wallLoss = 0;
+                for (let w of walls) {
+                    if (intersect({x: router.x, y: router.y}, {x: x, y: y}, {x: w.x1, y: w.y1}, {x: w.x2, y: w.y2})) {
+                        // Eğer 5GHz ise duvar kaybını %50 artır (Fizik kuralı)
+                        let freqPenalty = frequency > 4 ? 1.5 : 1.0;
+                        wallLoss += w.loss * freqPenalty; 
+                    }
+                }
+
+                // 3. Toplam Sinyal Gücü (Tx Power genellikle 20dBm)
+                let rssi = 20 - pathLoss - wallLoss;
+
+                // 4. Çizim
+                ctx.fillStyle = getColor(rssi);
+                ctx.fillRect(x, y, BLOCK_SIZE, BLOCK_SIZE);
+            }
+        }
+    }
+
+    // Arayüz Elemanlarını Çiz (Router ve Duvarlar)
+    function drawUI() {
+        // Duvarları çiz
+        ctx.lineWidth = 4;
+        for (let w of walls) {
+            ctx.strokeStyle = w.loss > 20 ? '#555' : '#888'; // Beton koyu, Cam açık renk
+            ctx.beginPath();
+            ctx.moveTo(w.x1, w.y1);
+            ctx.lineTo(w.x2, w.y2);
+            ctx.stroke();
+        }
+
+        // Çizim halindeki duvar
+        if (mode === 'draw' && isDragging && drawStart) {
+            ctx.strokeStyle = '#fff';
+            ctx.setLineDash([5, 5]);
+            ctx.beginPath();
+            ctx.moveTo(drawStart.x, drawStart.y);
+            ctx.lineTo(currentMouse.x, currentMouse.y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+
+        // Router'ı çiz
+        ctx.beginPath();
+        ctx.arc(router.x, router.y, 8, 0, Math.PI * 2);
+        ctx.fillStyle = '#00ffcc';
+        ctx.fill();
+        ctx.strokeStyle = 'white';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        
+        // Halka Efekti
+        ctx.beginPath();
+        ctx.arc(router.x, router.y, 15, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(0, 255, 204, 0.5)`;
+        ctx.stroke();
+    }
+
+    // Ana Döngü
+    function render() {
+        drawHeatmap(); // Ağır işlem
+        drawUI();      // Hafif işlem
+    }
+
+    // === ETKİLEŞİM ===
+    let currentMouse = {x:0, y:0};
+
+    canvas.addEventListener('mousedown', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        isDragging = true;
+
+        if (mode === 'move') {
+            router.x = x;
+            router.y = y;
+            render();
+        } else if (mode === 'draw') {
+            drawStart = { x, y };
+        }
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        currentMouse = {x, y};
+        
+        document.getElementById('stats').innerText = `Konum: ${Math.floor(x)}, ${Math.floor(y)}`;
+
+        if (isDragging) {
+            if (mode === 'move') {
+                router.x = x;
+                router.y = y;
+                // Sürüklerken performansı korumak için her karede render yapma (throttle)
+                requestAnimationFrame(render); 
+            } else if (mode === 'draw') {
+                // Sadece UI çiz, heatmap'i tekrar hesaplama
+                ctx.putImageData(savedHeatmap, 0, 0); 
+                drawUI();
+            }
+        }
+    });
+
+    let savedHeatmap; // Çizim yaparken arka planı saklamak için
+    canvas.addEventListener('mousedown', () => {
+        if(mode === 'draw') savedHeatmap = ctx.getImageData(0,0, canvas.width, canvas.height);
+    });
+
+    canvas.addEventListener('mouseup', (e) => {
+        if (mode === 'draw' && isDragging && drawStart) {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            
+            const loss = parseInt(document.getElementById('materialSelect').value);
+            walls.push({
+                x1: drawStart.x, 
+                y1: drawStart.y, 
+                x2: x, 
+                y2: y, 
+                loss: loss
+            });
+            drawStart = null;
+            render();
+        }
+        isDragging = false;
+    });
+
+    // === KONTROLLER ===
+    function updateParams() {
+        frequency = parseFloat(document.getElementById('freqSelect').value);
+        render();
+    }
+
+    function setMode(newMode) {
+        mode = newMode;
+        document.getElementById('btnMove').className = mode === 'move' ? 'active' : '';
+        document.getElementById('btnDraw').className = mode === 'draw' ? 'active' : '';
+    }
+
+    function clearWalls() {
+        walls = [];
+        render();
+    }
+
+    // Başlangıç
+    // Örnek bir duvar ekleyelim
+    walls.push({x1: 500, y1: 100, x2: 500, y2: 500, loss: 15});
+    render();
+
+</script>
+</body>
+</html>
